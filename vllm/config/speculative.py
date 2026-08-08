@@ -136,6 +136,10 @@ class SpeculativeConfig:
     for draft token generation. Reduces communication from O(vocab_size) to
     O(2 * tp_size) per token. Only applies to greedy draft selection in
     non-tree speculation."""
+    stream_output_before_drafting: bool = False
+    """Return sampled tokens before MTP drafting completes. The next model
+    execution is fenced until the draft is ready. Currently supported only by
+    the V1 GPU model runner for single-GPU MTP inference without KV transfer."""
 
     # Ngram proposer configuration
     prompt_lookup_max: int | None = Field(default=None, ge=1)
@@ -1030,6 +1034,11 @@ class SpeculativeConfig:
             raise ValueError(
                 "Expected num_speculative_tokens to be greater "
                 f"than zero ({self.num_speculative_tokens})."
+            )
+
+        if self.stream_output_before_drafting and self.method != "mtp":
+            raise ValueError(
+                "stream_output_before_drafting is only supported with method='mtp'."
             )
 
         if self.rejection_sample_method == "synthetic":

@@ -8,6 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
@@ -635,6 +636,29 @@ class GPUModelRunner(
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
+        self.stream_output_before_drafting = bool(
+            self.speculative_config
+            and self.speculative_config.stream_output_before_drafting
+        )
+        self._draft_executor: ThreadPoolExecutor | None = None
+        self._pending_draft_future: Future[None] | None = None
+        if self.stream_output_before_drafting:
+            kv_transfer_config = self.vllm_config.kv_transfer_config
+            if (
+                self.parallel_config.tensor_parallel_size != 1
+                or self.parallel_config.pipeline_parallel_size != 1
+                or (
+                    kv_transfer_config is not None
+                    and kv_transfer_config.is_kv_transfer_instance
+                )
+            ):
+                raise ValueError(
+                    "stream_output_before_drafting currently requires TP=1, PP=1, "
+                    "and no KV transfer connector."
+                )
+            self._draft_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="vllm-mtp-draft"
+            )
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1123,6 +1147,35 @@ class GPUModelRunner(
             stream = torch.cuda.Stream()
             self.async_output_copy_stream = stream
         return stream
+
+    def _submit_deferred_draft(self, task: Callable[[], None]) -> None:
+        """Run one draft task after sampled-token D2H has been queued."""
+        if self._draft_executor is None:
+            raise RuntimeError("Deferred draft executor is not initialized.")
+        if self._pending_draft_future is not None:
+            raise RuntimeError("A deferred draft task is already pending.")
+
+        draft_stream = torch.cuda.current_stream(self.device)
+
+        def run_task() -> None:
+            with (
+                torch.inference_mode(),
+                torch.accelerator.device_index(self.device.index),
+                torch.cuda.stream(draft_stream),
+            ):
+                task()
+
+        self._pending_draft_future = self._draft_executor.submit(run_task)
+
+    def _wait_for_pending_draft(self) -> None:
+        """Fence state reuse until the deferred MTP proposal is complete."""
+        future = self._pending_draft_future
+        if future is None:
+            return
+        try:
+            future.result()
+        finally:
+            self._pending_draft_future = None
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
@@ -4058,6 +4111,7 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        self._wait_for_pending_draft()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4490,7 +4544,10 @@ class GPUModelRunner(
         self.valid_sampled_token_count_gpu = None
         self.input_batch.prev_sampled_token_ids = None
 
-        def propose_draft_token_ids(sampled_token_ids):
+        def propose_draft_token_ids(
+            sampled_token_ids: torch.Tensor | list[list[int]],
+            prepared_next_token_ids: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ) -> None:
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
@@ -4503,11 +4560,14 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    prepared_next_token_ids,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
+        deferred_sampled_token_ids: torch.Tensor | None = None
+        deferred_next_token_ids: tuple[torch.Tensor, torch.Tensor] | None = None
         if spec_config is not None:
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = self._input_fits_in_drafter(
@@ -4531,7 +4591,19 @@ class GPUModelRunner(
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
-                    propose_draft_token_ids(sampled_token_ids)
+                    if self.stream_output_before_drafting:
+                        deferred_sampled_token_ids = sampled_token_ids
+                        deferred_next_token_ids = (
+                            self.drafter.prepare_next_token_ids_padded(
+                                sampled_token_ids,
+                                self.requests,
+                                self.input_batch,
+                                self.discard_request_mask.gpu,
+                            )
+                        )
+                        self._copy_valid_sampled_token_count(*deferred_next_token_ids)
+                    else:
+                        propose_draft_token_ids(sampled_token_ids)
                 elif self.valid_sampled_token_count_event is not None:
                     assert spec_decode_common_attn_metadata is not None
                     next_token_ids, valid_sampled_tokens_count = (
@@ -4600,19 +4672,33 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
-        if propose_drafts_after_bookkeeping:
-            # ngram and other speculative decoding methods use the sampled
-            # tokens on the CPU, so they are run after bookkeeping.
-            propose_draft_token_ids(valid_sampled_token_ids)
+        deferred_draft_task: Callable[[], None] | None = None
+        if deferred_sampled_token_ids is not None:
 
-        # Finalize KV connector (wait_for_save + clear metadata) after
-        # draft model runs. Deferred from target model forward to allow
-        # draft model to also save its KV cache.
-        if spec_config is not None:
-            self.finalize_kv_connector()
+            def run_deferred_draft() -> None:
+                propose_draft_token_ids(
+                    deferred_sampled_token_ids, deferred_next_token_ids
+                )
+                self.finalize_kv_connector()
+                with record_function_or_nullcontext("gpu_model_runner: eplb"):
+                    self.eplb_step()
 
-        with record_function_or_nullcontext("gpu_model_runner: eplb"):
-            self.eplb_step()
+            deferred_draft_task = run_deferred_draft
+
+        else:
+            if propose_drafts_after_bookkeeping:
+                # ngram and other speculative decoding methods use the sampled
+                # tokens on the CPU, so they are run after bookkeeping.
+                propose_draft_token_ids(valid_sampled_token_ids)
+
+            # Finalize KV connector (wait_for_save + clear metadata) after
+            # draft model runs. Deferred from target model forward to allow
+            # draft model to also save its KV cache.
+            if spec_config is not None:
+                self.finalize_kv_connector()
+
+            with record_function_or_nullcontext("gpu_model_runner: eplb"):
+                self.eplb_step()
 
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
@@ -4644,6 +4730,8 @@ class GPUModelRunner(
                     routing_data=self.routed_experts_cpu[:total].numpy(),
                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
                 )
+            if deferred_draft_task is not None:
+                self._submit_deferred_draft(deferred_draft_task)
             return output
 
         with record_function_or_nullcontext(
@@ -4690,6 +4778,11 @@ class GPUModelRunner(
                 async_output.sampled_token_ids_cpu,
                 async_output.async_copy_ready_event,
             )
+
+        if deferred_draft_task is not None:
+            # The output-copy stream has already recorded its dependency on the
+            # target stream, so later draft kernels cannot delay sampled-token D2H.
+            self._submit_deferred_draft(deferred_draft_task)
 
         return async_output
 
@@ -4741,6 +4834,7 @@ class GPUModelRunner(
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
+        self._wait_for_pending_draft()
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
@@ -4872,6 +4966,7 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        prepared_next_token_ids: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -5037,17 +5132,20 @@ class GPUModelRunner(
                     "sampled_token_ids should be a torch.Tensor when"
                     "padded-batch is enabled."
                 )
-                next_token_ids, valid_sampled_tokens_count = (
-                    self.drafter.prepare_next_token_ids_padded(
-                        sampled_token_ids,
-                        self.requests,
-                        self.input_batch,
-                        self.discard_request_mask.gpu,
+                if prepared_next_token_ids is None:
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
                     )
-                )
-                self._copy_valid_sampled_token_count(
-                    next_token_ids, valid_sampled_tokens_count
-                )
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
+                else:
+                    next_token_ids, valid_sampled_tokens_count = prepared_next_token_ids
 
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). Safe to
@@ -6354,6 +6452,13 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if self._draft_executor is not None:
+            try:
+                self._wait_for_pending_draft()
+            finally:
+                self._draft_executor.shutdown(wait=True)
+                self._draft_executor = None
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()

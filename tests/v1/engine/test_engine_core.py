@@ -4,8 +4,10 @@
 import copy
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from unittest.mock import PropertyMock, patch
+from contextlib import nullcontext
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 from transformers import AutoTokenizer
@@ -60,6 +62,52 @@ def make_request() -> EngineCoreRequest:
         cache_salt=None,
         data_parallel_rank=None,
     )
+
+
+@pytest.mark.parametrize("stream_output", [False, True])
+def test_stream_output_before_drafting_prioritizes_batch_output(
+    stream_output: bool,
+) -> None:
+    """Drain sampled output before post-step draft synchronization."""
+    engine_core = EngineCore.__new__(EngineCore)
+    engine_core.batch_queue_size = 2
+    engine_core.batch_queue = deque(maxlen=2)
+    engine_core.stream_output_before_drafting = stream_output
+    engine_core.is_ec_consumer = True
+    engine_core.is_pooling_model = False
+    engine_core.check_for_draft_tokens = True
+    engine_core._should_throttle_prefills = Mock(return_value=False)
+    engine_core._process_aborts_queue = Mock()
+    engine_core.log_error_detail = Mock(return_value=nullcontext())
+    engine_core.log_iteration_details = Mock(return_value=nullcontext())
+
+    scheduler_output = Mock(
+        total_num_scheduled_tokens=1,
+        pending_structured_output_tokens=False,
+    )
+    expected_output = {0: Mock()}
+    engine_core.scheduler = Mock()
+    engine_core.scheduler.has_requests.return_value = True
+    engine_core.scheduler.schedule.return_value = scheduler_output
+    engine_core.scheduler.update_from_output.return_value = expected_output
+
+    execute_future: Future[ModelRunnerOutput | None] = Future()
+    execute_future.set_result(Mock())
+    sample_future: Future[ModelRunnerOutput] = Future()
+    sample_future.set_result(Mock())
+    engine_core.model_executor = Mock()
+    engine_core.model_executor.execute_model.return_value = execute_future
+    engine_core.model_executor.sample_tokens.return_value = sample_future
+
+    output, model_executed = engine_core.step_with_batch_queue()
+
+    assert model_executed
+    if stream_output:
+        assert output is expected_output
+        assert not engine_core.batch_queue
+    else:
+        assert output is None
+        assert len(engine_core.batch_queue) == 1
 
 
 @create_new_process_for_each_test()

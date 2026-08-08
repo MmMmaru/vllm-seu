@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -309,6 +311,50 @@ def test_sample_tokens_skips_pp_group_lookup_without_async_scheduling(
 
     output = GPUModelRunner.sample_tokens(runner, None)
     assert output in (EMPTY_MODEL_RUNNER_OUTPUT, None)
+
+
+def test_deferred_draft_waits_and_propagates_errors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.device = torch.device("cuda:0")
+    runner._draft_executor = gpu_model_runner_module.ThreadPoolExecutor(max_workers=1)
+    runner._pending_draft_future = None
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: object())
+    monkeypatch.setattr(torch.accelerator, "device_index", lambda _index: nullcontext())
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def draft_task() -> None:
+        started.set()
+        assert release.wait(timeout=1)
+
+    runner._submit_deferred_draft(draft_task)
+    assert started.wait(timeout=1)
+
+    def wait_for_draft() -> None:
+        runner._wait_for_pending_draft()
+        finished.set()
+
+    waiter = threading.Thread(target=wait_for_draft)
+    waiter.start()
+    assert not finished.wait(timeout=0.05)
+    release.set()
+    waiter.join(timeout=1)
+    assert finished.is_set()
+
+    def failing_task() -> None:
+        raise ValueError("draft failed")
+
+    runner._submit_deferred_draft(failing_task)
+    with pytest.raises(ValueError, match="draft failed"):
+        runner._wait_for_pending_draft()
+
+    runner._draft_executor.shutdown(wait=True)
 
 
 def test_select_common_block_size_no_valid_option():

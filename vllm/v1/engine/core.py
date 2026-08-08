@@ -157,6 +157,10 @@ class EngineCore:
             hash_block_size=hash_block_size,
         )
         self.use_spec_decode = vllm_config.speculative_config is not None
+        self.stream_output_before_drafting = bool(
+            vllm_config.speculative_config
+            and vllm_config.speculative_config.stream_output_before_drafting
+        )
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
         )
@@ -573,8 +577,12 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
+                # Deferred MTP must surface this output before the next model
+                # execution waits for its pending draft.
+                if (
+                    len(batch_queue) < self.batch_queue_size
+                    and (model_executed or self.scheduler.has_requests())
+                    and not self.stream_output_before_drafting
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.

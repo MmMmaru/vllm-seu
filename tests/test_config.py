@@ -1493,6 +1493,15 @@ def test_draft_sample_method_gumbel_is_rejected():
         )
 
 
+def test_stream_output_before_drafting_requires_mtp():
+    with pytest.raises(ValidationError, match="only supported with method='mtp'"):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            stream_output_before_drafting=True,
+        )
+
+
 def test_ir_op_priority_default():
     """Test that IR op priority defaults are set correctly."""
     from vllm.config.kernel import IrOpPriorityConfig
