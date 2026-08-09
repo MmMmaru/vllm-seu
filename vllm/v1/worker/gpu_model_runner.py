@@ -4988,7 +4988,12 @@ class GPUModelRunner(
             )
         elif spec_config.method == "custom_class":
             assert isinstance(sampled_token_ids, list)
-            draft_token_ids = cast(Any, self.drafter).propose(
+            drafter = cast(Any, self.drafter)
+            # Optional stats hook: proposers that set wants_req_ids receive
+            # the batch-aligned request ids for per-request instrumentation.
+            if getattr(drafter, "wants_req_ids", False):
+                drafter.current_req_ids = list(self.input_batch.req_ids)
+            draft_token_ids = drafter.propose(
                 sampled_token_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
