@@ -1,0 +1,52 @@
+vllm-seu_test3 运行指令
+========================
+
+1. 进入工程目录
+
+cd /root/zsx/vllm-seu_test3
+chmod +x operate
+
+2. 快速验证（20 个样本）
+
+SAMPLES=20 ./operate fusion-ab
+
+该模式使用相同的 CUDA Graph 和 block table 配置，只对比：
+- no_fusion：关闭 Q/K RMSNorm + MRoPE + gate copy 算子融合
+- fusion：开启算子融合
+
+3. 正式测试算子融合（推荐 500 个样本）
+
+SAMPLES=500 ./operate fusion-ab
+
+生成文件：
+- result_no_fusion_500.json
+- result_fusion_500.json
+- .bench/ppu_tuning/logs/fusion_comparison_500.json
+
+4. 完整优化前后对比（推荐 500 个样本）
+
+SAMPLES=500 ./operate full-ab
+
+该模式对比：
+- baseline：系统安装的原始 vLLM 和默认 CUDA Graph 配置
+- optimized_fusion：CUDA Graph 调优 + block table 优化 + 算子融合
+
+生成文件：
+- result_baseline_500.json
+- result_optimized_fusion_500.json
+- .bench/ppu_tuning/logs/full_comparison_500.json
+
+5. 默认运行方式
+
+SAMPLES=500 ./operate
+
+不指定模式时，默认执行 fusion-ab。
+
+注意事项
+--------
+
+- 每个测试分支都会使用独立的临时冷缓存。
+- 开始下一组测试前，脚本会检查是否还有 VLLM::EngineCore 进程。
+- 测试使用相同模型、数据集、采样和评分逻辑。
+- fusion-ab 用于观察纯算子融合收益。
+- full-ab 用于观察全部优化组合后的整体收益。
