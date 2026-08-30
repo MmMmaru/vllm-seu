@@ -306,13 +306,24 @@ class Qwen3NextAttention(nn.Module):
 
         mm_config = model_config.multimodal_config if model_config else None
         text_only = mm_config is None or mm_config.language_model_only
-        self.use_fused_qk_norm_rope_gate = (
+        fused_qk_norm_rope_gate = (
             envs.VLLM_PPU_FUSED_QK_NORM_GATE
             and self.attn_output_gate
             and getattr(self.rotary_emb, "is_neox_style", False)
             and current_platform.is_cuda()
             and text_only
         )
+        logger.info_once(
+            "PPU fused QK-norm+RoPE+gate is %s (VLLM_PPU_FUSED_QK_NORM_GATE=%s, "
+            "attn_output_gate=%s, is_neox_style=%s, cuda=%s, text_only=%s).",
+            "enabled" if fused_qk_norm_rope_gate else "disabled",
+            envs.VLLM_PPU_FUSED_QK_NORM_GATE,
+            self.attn_output_gate,
+            getattr(self.rotary_emb, "is_neox_style", False),
+            current_platform.is_cuda(),
+            text_only,
+        )
+        self.use_fused_qk_norm_rope_gate = fused_qk_norm_rope_gate
 
     def _project_qkv_gate(
         self,

@@ -224,17 +224,26 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.mlp",
             )
         elif config.model_type == "qwen3_5_text":
+            fused_gate_silu = (
+                envs.VLLM_PPU_FUSED_GATE_SILU
+                and bool(getattr(model_config, "enforce_eager", False))
+                and vllm_config.lora_config is None
+            )
+            logger.info_once(
+                "PPU fused Gate+SiLU MLP is %s (VLLM_PPU_FUSED_GATE_SILU=%s, "
+                "enforce_eager=%s, lora_config=%s).",
+                "enabled" if fused_gate_silu else "disabled",
+                envs.VLLM_PPU_FUSED_GATE_SILU,
+                bool(getattr(model_config, "enforce_eager", False)),
+                vllm_config.lora_config is None,
+            )
             self.mlp = Qwen3_5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
-                enable_ppu_fused_gate_silu=(
-                    envs.VLLM_PPU_FUSED_GATE_SILU
-                    and bool(getattr(model_config, "enforce_eager", False))
-                    and vllm_config.lora_config is None
-                ),
+                enable_ppu_fused_gate_silu=fused_gate_silu,
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")

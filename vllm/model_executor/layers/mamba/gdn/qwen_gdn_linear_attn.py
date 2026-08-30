@@ -314,8 +314,19 @@ class ChunkGatedDeltaRule(CustomOp):
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
         elif envs.VLLM_PPU_FUSED_GDN_PREFILL:
+            logger.info_once(
+                "PPU fused GDN prefill kernel is enabled "
+                "(VLLM_PPU_FUSED_GDN_PREFILL=%s).",
+                envs.VLLM_PPU_FUSED_GDN_PREFILL,
+            )
             self._forward_method = self.forward_fused
         else:
+            logger.info_once(
+                "PPU fused GDN prefill kernel is disabled "
+                "(VLLM_PPU_FUSED_GDN_PREFILL=%s); falling back to native "
+                "Triton/FLA.",
+                envs.VLLM_PPU_FUSED_GDN_PREFILL,
+            )
             self._forward_method = self.forward_native
 
     def forward_cuda(
