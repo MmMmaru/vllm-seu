@@ -23,15 +23,15 @@ def _reference(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("seed", [20260625, 20260626, 20260627])
-def test_ppu_gate_silu_matches_vllm_bf16_path(seed: int) -> None:
+def test_ppu_gate_silu_matches_vllm_fp16_path(seed: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    x = torch.randn((1, K), generator=generator, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn((1, K), generator=generator, device="cuda", dtype=torch.float16)
     weight = (
         torch.randn(
             (2 * D, K),
             generator=generator,
             device="cuda",
-            dtype=torch.bfloat16,
+            dtype=torch.float16,
         )
         / K**0.5
     ).contiguous()
@@ -50,15 +50,15 @@ def test_ppu_gate_silu_matches_vllm_bf16_path(seed: int) -> None:
 
 
 def test_ppu_gate_silu_zero_input_is_exact_zero() -> None:
-    x = torch.zeros((1, K), device="cuda", dtype=torch.bfloat16)
-    weight = torch.empty((2 * D, K), device="cuda", dtype=torch.bfloat16)
+    x = torch.zeros((1, K), device="cuda", dtype=torch.float16)
+    weight = torch.empty((2 * D, K), device="cuda", dtype=torch.float16)
     actual = torch.ops._C.ppu_gate_silu(x, weight)
     torch.cuda.synchronize()
     assert torch.count_nonzero(actual).item() == 0
 
 
 def test_ppu_gate_silu_rejects_prefill_shape() -> None:
-    x = torch.empty((2, K), device="cuda", dtype=torch.bfloat16)
-    weight = torch.empty((2 * D, K), device="cuda", dtype=torch.bfloat16)
+    x = torch.empty((2, K), device="cuda", dtype=torch.float16)
+    weight = torch.empty((2 * D, K), device="cuda", dtype=torch.float16)
     with pytest.raises(RuntimeError, match=r"x must have shape \[1, 2048\]"):
         torch.ops._C.ppu_gate_silu(x, weight)

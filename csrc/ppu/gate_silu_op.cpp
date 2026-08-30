@@ -27,8 +27,8 @@ torch::Tensor ppu_gate_silu(const torch::Tensor& x,
   TORCH_CHECK(x.device() == weight.device(),
               "x and weight must share a device");
   TORCH_CHECK(
-      x.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
-      "_C::ppu_gate_silu requires BF16 x and weight");
+      x.scalar_type() == at::kHalf && weight.scalar_type() == at::kHalf,
+      "_C::ppu_gate_silu requires FP16 x and weight");
   TORCH_CHECK(x.dim() == 2 && x.size(0) == kM && x.size(1) == kK,
               "x must have shape [1, 2048], got ", x.sizes());
   TORCH_CHECK(weight.dim() == 2 && weight.size(0) == kN && weight.size(1) == kK,

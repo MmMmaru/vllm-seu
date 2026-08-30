@@ -149,15 +149,13 @@ class Qwen3_5MLP(Qwen2MoeMLP):
         return (
             x.ndim == 2
             and tuple(x.shape) == (1, 2048)
-            and x.dtype is torch.bfloat16
+            and x.dtype is torch.float16
             and x.is_cuda
             and x.is_contiguous()
-            and x.data_ptr() % 16 == 0
             and tuple(weight.shape) == (12288, 2048)
-            and weight.dtype is torch.bfloat16
+            and weight.dtype is torch.float16
             and weight.is_cuda
             and weight.is_contiguous()
-            and weight.data_ptr() % 16 == 0
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -226,15 +224,13 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         elif config.model_type == "qwen3_5_text":
             fused_gate_silu = (
                 envs.VLLM_PPU_FUSED_GATE_SILU
-                and bool(getattr(model_config, "enforce_eager", False))
                 and vllm_config.lora_config is None
             )
             logger.info_once(
                 "PPU fused Gate+SiLU MLP is %s (VLLM_PPU_FUSED_GATE_SILU=%s, "
-                "enforce_eager=%s, lora_config=%s).",
+                "lora_config=%s).",
                 "enabled" if fused_gate_silu else "disabled",
                 envs.VLLM_PPU_FUSED_GATE_SILU,
-                bool(getattr(model_config, "enforce_eager", False)),
                 vllm_config.lora_config is None,
             )
             self.mlp = Qwen3_5MLP(

@@ -110,6 +110,21 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "scaled_fp4_quant"):
         return None
 
 
+if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "ppu_gate_silu"):
+
+    @register_fake("_C::ppu_gate_silu")
+    def _ppu_gate_silu_fake(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        # Fused gate_up + SwiGLU: (M, K) x (2*D, K)^T -> (M, D).
+        return torch.empty(
+            (input.shape[0], weight.shape[0] // 2),
+            device=input.device,
+            dtype=input.dtype,
+        )
+
+
 # page attention ops
 def paged_attention_v1(
     out: torch.Tensor,
