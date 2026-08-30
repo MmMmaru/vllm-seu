@@ -1,0 +1,122 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+#include "hggcrt.h"
+#include "hggc_bf16.h"
+
+#include <math.h>
+#include <stdint.h>
+
+namespace {
+
+constexpr int kK = 2048;
+constexpr int kD = 6144;
+constexpr int kN = 2 * kD;
+constexpr int kWarpSize = 32;
+constexpr int kWarpsPerBlock = 4;
+constexpr int kOutputsPerBlock = 2;
+
+__forceinline__ __device__ __ppu_bfloat162 bits_to_bfloat162(
+    unsigned int bits) {
+  __ppu_bfloat162 value;
+  *reinterpret_cast<unsigned int*>(&value) = bits;
+  return value;
+}
+
+__forceinline__ __device__ float dot_bfloat16x8(const float2& x0,
+                                                const float2& x1,
+                                                const float2& x2,
+                                                const float2& x3,
+                                                const uint4& weight_bits) {
+  const float2 w0 = __bfloat1622float2(bits_to_bfloat162(weight_bits.x));
+  const float2 w1 = __bfloat1622float2(bits_to_bfloat162(weight_bits.y));
+  const float2 w2 = __bfloat1622float2(bits_to_bfloat162(weight_bits.z));
+  const float2 w3 = __bfloat1622float2(bits_to_bfloat162(weight_bits.w));
+  return x0.x * w0.x + x0.y * w0.y + x1.x * w1.x + x1.y * w1.y +
+         x2.x * w2.x + x2.y * w2.y + x3.x * w3.x + x3.y * w3.y;
+}
+
+__forceinline__ __device__ __ppu_bfloat16 swiglu_with_bf16_boundaries(
+    float gate_accum,
+    float up_accum) {
+  // Match the production chain's observable BF16 boundaries:
+  //   1) F.linear writes BF16 gate and up values;
+  //   2) packed_silu converts the FP32 result back to BF16;
+  //   3) packed_mul returns BF16.
+  const __ppu_bfloat16 gate_bf16 = __float2bfloat16_rn(gate_accum);
+  const __ppu_bfloat16 up_bf16 = __float2bfloat16_rn(up_accum);
+  const float gate = __bfloat162float(gate_bf16);
+  const float up = __bfloat162float(up_bf16);
+  const float silu = gate / (1.0f + expf(-gate));
+  const __ppu_bfloat16 silu_bf16 = __float2bfloat16_rn(silu);
+  const float product = __bfloat162float(silu_bf16) * up;
+  return __float2bfloat16_rn(product);
+}
+
+// One warp computes one weight row, preserving the best gate-only vec8_r1_w4
+// structure. Warp 0/1 compute two consecutive gate rows, and warp 2/3 compute
+// their paired up rows. This keeps four warps and the same total warp count as
+// the gate-only probe while removing the intermediate [1, 12288] tensor and
+// the standalone activation launch.
+__global__ void gate_silu_fused_pair_w4_kernel(
+    const __ppu_bfloat16* __restrict__ x,
+    const __ppu_bfloat16* __restrict__ weight,
+    __ppu_bfloat16* __restrict__ output) {
+  __shared__ float pair_accum[kWarpsPerBlock];
+
+  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int warp = threadIdx.x / kWarpSize;
+  const int output_base = static_cast<int>(blockIdx.x) * kOutputsPerBlock;
+  const int output_index = output_base + (warp & 1);
+  const int row = output_index + (warp >= 2 ? kD : 0);
+
+  float accum = 0.0f;
+  constexpr int kItemsPerLane = 8;
+  constexpr int kIterationStride = kWarpSize * kItemsPerLane;
+  if (output_index < kD) {
+    for (int k = lane * kItemsPerLane; k < kK; k += kIterationStride) {
+      const uint4 x_bits =
+          __ldg(reinterpret_cast<const uint4*>(x + static_cast<int64_t>(k)));
+      const float2 x0 = __bfloat1622float2(bits_to_bfloat162(x_bits.x));
+      const float2 x1 = __bfloat1622float2(bits_to_bfloat162(x_bits.y));
+      const float2 x2 = __bfloat1622float2(bits_to_bfloat162(x_bits.z));
+      const float2 x3 = __bfloat1622float2(bits_to_bfloat162(x_bits.w));
+
+      const int64_t weight_offset = static_cast<int64_t>(row) * kK + k;
+      const uint4 weight_bits =
+          __ldg(reinterpret_cast<const uint4*>(weight + weight_offset));
+      accum += dot_bfloat16x8(x0, x1, x2, x3, weight_bits);
+    }
+  }
+
+#pragma unroll
+  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
+    accum += __shfl_down_sync(0xffffffffU, accum, offset, kWarpSize);
+  }
+
+  if (lane == 0) {
+    pair_accum[warp] = accum;
+  }
+  __syncthreads();
+
+  if (lane == 0 && warp < 2 && output_index < kD) {
+    output[output_index] =
+        swiglu_with_bf16_boundaries(pair_accum[warp], pair_accum[warp + 2]);
+  }
+}
+
+}  // namespace
+
+extern "C" int vllm_ppu_gate_silu_launch(const void* x,
+                                          const void* weight,
+                                          void* output,
+                                          void* stream_handle) {
+  const auto stream = reinterpret_cast<hggcStream_t>(stream_handle);
+  constexpr int kThreads = kWarpsPerBlock * kWarpSize;
+  constexpr int kBlocks = (kD + kOutputsPerBlock - 1) / kOutputsPerBlock;
+  gate_silu_fused_pair_w4_kernel<<<kBlocks, kThreads, 0, stream>>>(
+      static_cast<const __ppu_bfloat16*>(x),
+      static_cast<const __ppu_bfloat16*>(weight),
+      static_cast<__ppu_bfloat16*>(output));
+  return static_cast<int>(hggcGetLastError());
+}

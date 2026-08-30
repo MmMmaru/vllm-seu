@@ -56,6 +56,11 @@ void silu_and_mul_clamp(torch::Tensor& out, torch::Tensor& input, double limit,
 void silu_and_mul_quant(torch::Tensor& out, torch::Tensor& input,
                         torch::Tensor& scale);
 
+#ifdef VLLM_PPU_GATE_SILU
+torch::Tensor ppu_gate_silu(const torch::Tensor& input,
+                            const torch::Tensor& weight);
+#endif
+
 void persistent_masked_m_silu_mul_quant(
     const at::Tensor& input,   // (E, T, 2*H)
     const at::Tensor& counts,  // (E)

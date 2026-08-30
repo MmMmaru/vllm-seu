@@ -319,6 +319,36 @@ set(VLLM_EXT_SRC
   "csrc/quantization/activation_kernels.cu"
   "csrc/torch_bindings.cpp")
 
+if(VLLM_TARGET_DEVICE STREQUAL "ppu")
+  find_program(HGGC_COMPILER
+    NAMES clang++
+    HINTS "${PPU_SDK}/bin"
+    NO_DEFAULT_PATH
+    REQUIRED)
+
+  set(VLLM_PPU_GATE_SILU_SRC
+    "${CMAKE_CURRENT_SOURCE_DIR}/csrc/ppu/gate_silu_fused.hg")
+  set(VLLM_PPU_GATE_SILU_OBJ
+    "${CMAKE_CURRENT_BINARY_DIR}/csrc/ppu/gate_silu_fused.o")
+
+  add_custom_command(
+    OUTPUT "${VLLM_PPU_GATE_SILU_OBJ}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory
+      "${CMAKE_CURRENT_BINARY_DIR}/csrc/ppu"
+    COMMAND "${HGGC_COMPILER}" -O3 -x hggc -fPIC -c
+      "${VLLM_PPU_GATE_SILU_SRC}"
+      -o "${VLLM_PPU_GATE_SILU_OBJ}"
+    DEPENDS "${VLLM_PPU_GATE_SILU_SRC}"
+    COMMENT "Building PPU fused gate-SiLU kernel"
+    VERBATIM)
+
+  set_source_files_properties("${VLLM_PPU_GATE_SILU_OBJ}"
+    PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  list(APPEND VLLM_EXT_SRC
+    "csrc/ppu/gate_silu_op.cpp"
+    "${VLLM_PPU_GATE_SILU_OBJ}")
+endif()
+
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
 
@@ -636,6 +666,20 @@ define_extension_target(
 # driver API. This causes problems when linking with earlier versions of CUDA.
 # Setting this variable sidesteps the issue by calling the driver directly.
 target_compile_definitions(_C PRIVATE CUTLASS_ENABLE_DIRECT_CUDA_DRIVER_CALL=1)
+
+if(VLLM_TARGET_DEVICE STREQUAL "ppu")
+  target_compile_definitions(_C PRIVATE VLLM_PPU_GATE_SILU=1)
+  target_link_options(_C PRIVATE
+    "-L${PPU_SDK}/lib"
+    "-L${PPU_SDK}/CUDA_SDK/lib64")
+  target_link_libraries(_C PRIVATE
+    "${PPU_SDK}/lib/libhggc.so"
+    "${PPU_SDK}/lib/libhggcrt1.so"
+    "${PPU_SDK}/lib/libalippu.so"
+    "${PPU_SDK}/lib/libuki.so")
+  set_property(TARGET _C APPEND PROPERTY BUILD_RPATH "${PPU_SDK}/lib")
+  set_property(TARGET _C APPEND PROPERTY INSTALL_RPATH "${PPU_SDK}/lib")
+endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   #

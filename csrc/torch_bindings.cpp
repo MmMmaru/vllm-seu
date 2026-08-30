@@ -47,6 +47,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "silu_and_mul_quant(Tensor! result, Tensor input, Tensor scale) -> ()");
   ops.impl("silu_and_mul_quant", torch::kCUDA, &silu_and_mul_quant);
 
+#ifdef VLLM_PPU_GATE_SILU
+  ops.def("ppu_gate_silu(Tensor input, Tensor weight) -> Tensor");
+  ops.impl("ppu_gate_silu", torch::kCUDA, &ppu_gate_silu);
+#endif
+
   // Horizontally-fused DeepseekV4-MLA: per-head RMSNorm + GPT-J RoPE for Q, and
   // GPT-J RoPE + UE8M0 FP8 quant + paged cache insert for KV, all in one
   // kernel launch. Registered in _C_stable_libtorch (incl. the FlashInfer V4

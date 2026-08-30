@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -39,6 +40,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
     GemmaRMSNorm as Qwen3_5RMSNorm,
 )
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
@@ -49,6 +51,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -58,6 +61,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -78,7 +82,7 @@ from .interfaces import (
     SupportsPP,
     _require_is_multimodal,
 )
-from .qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
+from .qwen2_moe import Qwen2MoeMLP
 from .qwen3_next import (
     Qwen3NextAttention,
     Qwen3NextDecoderLayer,
@@ -105,6 +109,66 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+class Qwen3_5MLP(Qwen2MoeMLP):
+    """Qwen3.5 dense MLP with an optional PPU decode fast path."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        enable_ppu_fused_gate_silu: bool = False,
+    ) -> None:
+        super().__init__(
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            hidden_act=hidden_act,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        gate = self.gate_up_proj
+        self._use_ppu_fused_gate_silu = (
+            enable_ppu_fused_gate_silu
+            and current_platform.is_ppu()
+            and hidden_size == 2048
+            and intermediate_size == 6144
+            and isinstance(gate.quant_method, UnquantizedLinearMethod)
+            and gate.tp_size == 1
+            and tuple(gate.output_sizes) == (6144, 6144)
+            and gate.bias is None
+        )
+
+    def _can_use_ppu_fused_gate_silu(self, x: torch.Tensor) -> bool:
+        if not self._use_ppu_fused_gate_silu:
+            return False
+        weight = self.gate_up_proj.weight
+        return (
+            x.ndim == 2
+            and tuple(x.shape) == (1, 2048)
+            and x.dtype is torch.bfloat16
+            and x.is_cuda
+            and x.is_contiguous()
+            and x.data_ptr() % 16 == 0
+            and tuple(weight.shape) == (12288, 2048)
+            and weight.dtype is torch.bfloat16
+            and weight.is_cuda
+            and weight.is_contiguous()
+            and weight.data_ptr() % 16 == 0
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._can_use_ppu_fused_gate_silu(x):
+            out = torch.ops._C.ppu_gate_silu(x, self.gate_up_proj.weight)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
+            out = self.act_fn(gate_up)
+
+        out, _ = self.down_proj(out)
+        return out
 
 
 class Qwen3_5ProcessingInfo(Qwen3VLProcessingInfo):
@@ -160,12 +224,17 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.mlp",
             )
         elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3NextMLP(
+            self.mlp = Qwen3_5MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
+                enable_ppu_fused_gate_silu=(
+                    envs.VLLM_PPU_FUSED_GATE_SILU
+                    and bool(getattr(model_config, "enforce_eager", False))
+                    and vllm_config.lora_config is None
+                ),
             )
         else:
             raise ValueError(f"Invalid model_type {config.model_type}")
