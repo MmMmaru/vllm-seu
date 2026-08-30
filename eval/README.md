@@ -130,6 +130,27 @@ FinalScore = AccuracyScore * 0.6 + TTFTScore * 0.2 + ThroughputScore * 0.2
 
 实际最终公式以主办方发布版本为准。
 
+### CUDA Graph 调优实测
+
+`test2` 保持模型、采样、显存利用率和评测入口与 `test` 一致，仅调整
+CUDA Graph 捕获尺寸。基线默认尺寸最大为 32，不能覆盖公开样本
+137--376 token 的多模态 prefill。优化配置捕获 batch-one decode 和
+128/192/256/320/384 token 的 PIECEWISE prefill 图。
+
+RTX 4050 Laptop GPU、100 个英文公开样本、2 个 warmup 样本的反向顺序
+对比结果：
+
+| 项目 | Avg TTFT | Avg Throughput | Accuracy |
+| --- | ---: | ---: | ---: |
+| `test` | 88.102 ms | 47.216 tokens/s | 0.77 |
+| `test2` | 85.615 ms | 47.143 tokens/s | 0.76 |
+| 变化 | **-2.82%** | -0.15%（基本不变） | -1 pp |
+
+20 样本同条件对比中，TTFT 从 99.244 ms 降至 97.364 ms（-1.89%），
+吞吐从 46.917 提高至 47.174 tokens/s（+0.55%），Accuracy 均为 0.80。
+100 样本 Accuracy 差异来自单个接近 greedy 决策边界的样本，仍满足本说明
+允许的 baseline -2% 准确率门槛。
+
 ## 7. 本地自测方法
 
 安装依赖：

@@ -24,7 +24,7 @@ from pathlib import Path
 
 # Use this checkout's Python sources even when the shared virtual environment
 # contains an editable vLLM installation pointing at another checkout.
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2] / "runtime"
 if (
     os.environ.get("ZSX_USE_INSTALLED_VLLM") != "1"
     and str(PROJECT_ROOT) not in sys.path

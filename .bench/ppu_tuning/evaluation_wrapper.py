@@ -155,20 +155,39 @@ class VLMModel:
             trust_remote_code=True,
         )
         self._vllm_loop = asyncio.new_event_loop()
+        engine_overrides = {}
+        if os.environ.get("ZSX_TUNED_CUDAGRAPHS") == "1":
+            engine_overrides["compilation_config"] = {
+                "cudagraph_capture_sizes": [
+                    1, 2, 4, 8, 16, 24, 32,
+                    128, 192, 256, 320, 384, 448, 512, 576,
+                ],
+                "cudagraph_mm_encoder": True,
+                "encoder_cudagraph_token_budgets": [
+                    256, 384, 512, 640, 768, 896, 1024,
+                ],
+                "encoder_cudagraph_max_vision_items_per_batch": 1,
+            }
         engine_args = AsyncEngineArgs(
             model=self.model_path,
             tokenizer=self.model_path,
             trust_remote_code=True,
             dtype="float16",
-            max_model_len=2048,
-            max_num_seqs=16,
+            max_model_len=int(os.environ.get("ZSX_MAX_MODEL_LEN", "2048")),
+            max_num_seqs=int(os.environ.get("ZSX_MAX_NUM_SEQS", "16")),
             gpu_memory_utilization=float(
                 os.environ.get("ZSX_GPU_MEMORY_UTILIZATION", "0.82")
             ),
             enable_prefix_caching=False,
             enforce_eager=os.environ.get("ZSX_PPU_EAGER") == "1",
+            enable_flashinfer_autotune=(
+                False
+                if os.environ.get("ZSX_FLASHINFER_AUTOTUNE") == "0"
+                else None
+            ),
             skip_mm_profiling=True,
             limit_mm_per_prompt={"image": 1},
+            **engine_overrides,
         )
         self._model = AsyncLLM.from_engine_args(engine_args)
         self._tokenizer = self._model.tokenizer
