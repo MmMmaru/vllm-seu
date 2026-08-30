@@ -292,6 +292,7 @@ if TYPE_CHECKING:
     VLLM_PPU_FUSED_GDN_DECODE: bool = True
     VLLM_PPU_FUSED_GDN_PREFILL: bool = True
     VLLM_PPU_FUSED_GATE_SILU: bool = False
+    VLLM_PPU_FUSED_QK_NORM_GATE: bool = True
     VLLM_PPU_USE_TRITON_INT8_QUANT: bool = True
     VLLM_PPU_NVTX_PROFILE: bool = False
     VLLM_PPU_NVTX_DUMP_TOPK: bool = False
@@ -2087,6 +2088,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fuse Qwen3.5-2B gate_up projection with SwiGLU for single-token decode.
     "VLLM_PPU_FUSED_GATE_SILU": lambda: (
         os.getenv("VLLM_PPU_FUSED_GATE_SILU", "False").strip().lower()
+        in ("true", "1")
+    ),
+    # Fuse QKV split + QK-RMSNorm + (partial) RoPE + gate copy into a single
+    # Triton kernel for Qwen3.5/Qwen3-Next attention.
+    "VLLM_PPU_FUSED_QK_NORM_GATE": lambda: (
+        os.getenv("VLLM_PPU_FUSED_QK_NORM_GATE", "True").strip().lower()
         in ("true", "1")
     ),
     # Use triton_int8_quant
