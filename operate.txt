@@ -1,52 +1,126 @@
-vllm-seu_test3 运行指令
-========================
+vllm-seu_test3 不同优化对应的运行指令
+========================================
+
+说明：项目不使用根目录 operate 脚本，下面直接调用 .bench/ppu_tuning 中的脚本。
 
 1. 进入工程目录
 
 cd /root/zsx/vllm-seu_test3
-chmod +x operate
 
-2. 快速验证（20 个样本）
+2. 只对比算子融合
 
-SAMPLES=20 ./operate fusion-ab
+先生成包含 test3 优化文件的临时 runtime：
 
-该模式使用相同的 CUDA Graph 和 block table 配置，只对比：
-- no_fusion：关闭 Q/K RMSNorm + MRoPE + gate copy 算子融合
-- fusion：开启算子融合
+bash .bench/ppu_tuning/prepare_runtime_overlay.sh
 
-3. 正式测试算子融合（推荐 500 个样本）
+关闭融合运行 500 个样本：
 
-SAMPLES=500 ./operate fusion-ab
+VLLM_FUSION_DEBUG=1 \
+VLLM_USE_FUSED_QK_NORM_ROPE_GATE=0 \
+bash .bench/ppu_tuning/run_candidate_cold.sh \
+  result_no_fusion_500.json 500
 
-生成文件：
-- result_no_fusion_500.json
-- result_fusion_500.json
-- .bench/ppu_tuning/logs/fusion_comparison_500.json
+确认上一轮 EngineCore 已退出：
 
-4. 完整优化前后对比（推荐 500 个样本）
+pgrep -af '[V]LLM::EngineCore'
 
-SAMPLES=500 ./operate full-ab
+开启融合运行 500 个样本：
 
-该模式对比：
-- baseline：系统安装的原始 vLLM 和默认 CUDA Graph 配置
-- optimized_fusion：CUDA Graph 调优 + block table 优化 + 算子融合
+VLLM_FUSION_DEBUG=1 \
+VLLM_USE_FUSED_QK_NORM_ROPE_GATE=1 \
+bash .bench/ppu_tuning/run_candidate_cold.sh \
+  result_fusion_500.json 500
 
-生成文件：
-- result_baseline_500.json
-- result_optimized_fusion_500.json
-- .bench/ppu_tuning/logs/full_comparison_500.json
+比较结果：
 
-5. 默认运行方式
+.venv/bin/python .bench/ppu_tuning/compare_public_results.py \
+  result_no_fusion_500.json \
+  result_fusion_500.json \
+  | tee .bench/ppu_tuning/logs/fusion_comparison_500.json
 
-SAMPLES=500 ./operate
+两轮使用相同 CUDA Graph、block table、模型和数据集，只切换融合环境变量，
+因此该组用于观察 Q/K RMSNorm + MRoPE + gate copy 融合本身的收益。
 
-不指定模式时，默认执行 fusion-ab。
+3. 只对比 CUDA Graph 配置
+
+运行默认 CUDA Graph 基线：
+
+bash .bench/ppu_tuning/run_baseline_cold.sh \
+  result_cudagraph_baseline_500.json 500
+
+运行 CUDA Graph 调优版本：
+
+bash .bench/ppu_tuning/run_cudagraph_tuned_cold.sh
+
+比较结果：
+
+.venv/bin/python .bench/ppu_tuning/compare_public_results.py \
+  result_cudagraph_baseline_500.json \
+  result_cudagraph_tuned_cold_500.json \
+  | tee .bench/ppu_tuning/logs/cudagraph_comparison_500.json
+
+该组使用系统安装版 vLLM，不加载 test3 的算子融合 runtime overlay：
+
+- baseline：默认 CUDA Graph，视觉 Encoder Graph 关闭，捕获尺寸最大约 32
+- cudagraph_tuned：prefill 捕获扩大到 576，视觉 Encoder Graph 开启，视觉 token 捕获到 1024
+
+run_cudagraph_tuned_cold.sh 当前固定运行 500 个样本。
+
+4. 对比全部优化组合
+
+先生成优化 runtime：
+
+bash .bench/ppu_tuning/prepare_runtime_overlay.sh
+
+运行原始基线：
+
+bash .bench/ppu_tuning/run_baseline_cold.sh \
+  result_baseline_500.json 500
+
+确认上一轮 EngineCore 已退出：
+
+pgrep -af '[V]LLM::EngineCore'
+
+运行 CUDA Graph 调优 + block table 优化 + 算子融合：
+
+VLLM_FUSION_DEBUG=1 \
+VLLM_USE_FUSED_QK_NORM_ROPE_GATE=1 \
+bash .bench/ppu_tuning/run_candidate_cold.sh \
+  result_optimized_fusion_500.json 500
+
+比较结果：
+
+.venv/bin/python .bench/ppu_tuning/compare_public_results.py \
+  result_baseline_500.json \
+  result_optimized_fusion_500.json \
+  | tee .bench/ppu_tuning/logs/full_comparison_500.json
+
+5. 快速验证算子融合流程（20 个样本）
+
+bash .bench/ppu_tuning/prepare_runtime_overlay.sh
+
+VLLM_USE_FUSED_QK_NORM_ROPE_GATE=0 \
+bash .bench/ppu_tuning/run_candidate_cold.sh \
+  result_no_fusion_20.json 20
+
+VLLM_USE_FUSED_QK_NORM_ROPE_GATE=1 \
+bash .bench/ppu_tuning/run_candidate_cold.sh \
+  result_fusion_20.json 20
+
+.venv/bin/python .bench/ppu_tuning/compare_public_results.py \
+  result_no_fusion_20.json result_fusion_20.json
+
+优化与命令对应关系
+--------------------
+
+- 纯算子融合：两次 run_candidate_cold.sh，分别设置融合开关 0 和 1
+- 纯 CUDA Graph：run_baseline_cold.sh 对比 run_cudagraph_tuned_cold.sh
+- 全部优化：run_baseline_cold.sh 对比开启融合的 run_candidate_cold.sh
 
 注意事项
 --------
 
-- 每个测试分支都会使用独立的临时冷缓存。
-- 开始下一组测试前，脚本会检查是否还有 VLLM::EngineCore 进程。
-- 测试使用相同模型、数据集、采样和评分逻辑。
-- fusion-ab 用于观察纯算子融合收益。
-- full-ab 用于观察全部优化组合后的整体收益。
+- 开始下一轮前，pgrep 不应显示残留的 VLLM::EngineCore 进程。
+- baseline/candidate 必须使用相同模型、数据集、样本数和评分逻辑。
+- 纯 CUDA Graph 命令不应用 test3 的融合 kernel。
+- 全部优化对比同时包含多项优化，不能把全部提升归因于单个优化。
