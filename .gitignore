@@ -225,6 +225,11 @@ eval/Qwen3.5-2B/
 # Python pickle files
 *.pkl
 
+# Local PPU benchmark artifacts
+.bench/runtime/
+.bench/**/logs/
+result_*.json
+
 # Sphinx documentation
 _build/
 
