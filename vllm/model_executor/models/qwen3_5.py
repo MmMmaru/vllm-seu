@@ -30,6 +30,7 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -141,6 +142,9 @@ class Qwen3_5MLP(Qwen2MoeMLP):
             and tuple(gate.output_sizes) == (6144, 6144)
             and gate.bias is None
         )
+        self._ppu_gate_silu_native_activation = not (
+            self.act_fn._enforce_enable or self.act_fn.enabled()
+        )
 
     def _can_use_ppu_fused_gate_silu(self, x: torch.Tensor) -> bool:
         if not self._use_ppu_fused_gate_silu:
@@ -161,7 +165,13 @@ class Qwen3_5MLP(Qwen2MoeMLP):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._can_use_ppu_fused_gate_silu(x):
+        if self._use_ppu_fused_gate_silu and torch.compiler.is_compiling():
+            # Keep M-dependent and pointer checks out of Dynamo. A graph first
+            # traced on prefill must retain the single-token decode fast path.
+            out = ops.ppu_gate_silu(
+                x, self.gate_up_proj.weight, self._ppu_gate_silu_native_activation
+            )
+        elif self._can_use_ppu_fused_gate_silu(x):
             out = torch.ops._C.ppu_gate_silu(x, self.gate_up_proj.weight)
         else:
             gate_up, _ = self.gate_up_proj(x)
@@ -232,7 +242,6 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 prefix=f"{prefix}.mlp",
                 enable_ppu_fused_gate_silu=(
                     envs.VLLM_PPU_FUSED_GATE_SILU
-                    and bool(getattr(model_config, "enforce_eager", False))
                     and vllm_config.lora_config is None
                 ),
             )

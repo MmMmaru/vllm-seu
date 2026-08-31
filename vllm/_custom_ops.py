@@ -14,6 +14,7 @@ from vllm.utils.flashinfer import (
     flashinfer_quant_nvfp4_8x4_sf_layout,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -28,6 +29,72 @@ else:
         from torch.library import register_fake
     except ImportError:
         from torch.library import impl_abstract as register_fake
+
+
+def _ppu_gate_silu_can_fuse(input: torch.Tensor, weight: torch.Tensor) -> bool:
+    # This predicate runs inside an opaque operator, not during Dynamo tracing.
+    return (
+        input.ndim == 2
+        and tuple(input.shape) == (1, 2048)
+        and tuple(weight.shape) == (12288, 2048)
+        and input.dtype == weight.dtype == torch.bfloat16
+        and input.is_cuda
+        and input.device == weight.device
+        and input.is_contiguous()
+        and weight.is_contiguous()
+        and input.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    )
+
+
+def _ppu_gate_silu_dispatch(
+    input: torch.Tensor, weight: torch.Tensor, native_activation: bool
+) -> torch.Tensor:
+    if _ppu_gate_silu_can_fuse(input, weight):
+        return torch.ops._C.ppu_gate_silu(input, weight)
+    # Keep prefill/other batch sizes valid when a dynamic graph is reused.
+    gate_up = torch.nn.functional.linear(input, weight)
+    d = gate_up.shape[-1] // 2
+    if native_activation:
+        return torch.nn.functional.silu(gate_up[..., :d]) * gate_up[..., d:]
+    output = torch.empty(
+        gate_up.shape[:-1] + (d,), dtype=gate_up.dtype, device=gate_up.device
+    )
+    torch.ops._C.silu_and_mul(output, gate_up)
+    return output
+
+
+def _ppu_gate_silu_dispatch_fake(
+    input: torch.Tensor, weight: torch.Tensor, native_activation: bool
+) -> torch.Tensor:
+    return input.new_empty(input.shape[:-1] + (weight.shape[0] // 2,))
+
+
+if current_platform.is_ppu() and hasattr(torch.ops._C, "ppu_gate_silu"):
+
+    @register_fake("_C::ppu_gate_silu")
+    def _ppu_gate_silu_fake(
+        input: torch.Tensor, weight: torch.Tensor
+    ) -> torch.Tensor:
+        torch._check(input.ndim == 2)
+        torch._check(input.shape[0] == 1)
+        torch._check(input.shape[1] == 2048)
+        torch._check(weight.ndim == 2)
+        torch._check(weight.shape[0] == 12288)
+        torch._check(weight.shape[1] == 2048)
+        return input.new_empty((1, 6144))
+
+    direct_register_custom_op(
+        op_name="ppu_gate_silu",
+        op_func=_ppu_gate_silu_dispatch,
+        fake_impl=_ppu_gate_silu_dispatch_fake,
+    )
+
+
+def ppu_gate_silu(
+    input: torch.Tensor, weight: torch.Tensor, native_activation: bool
+) -> torch.Tensor:
+    return torch.ops.vllm.ppu_gate_silu(input, weight, native_activation)
 
 
 # scaled_fp4_quant functional + out variant for torch.compile buffer management
