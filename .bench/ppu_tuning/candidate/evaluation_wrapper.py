@@ -155,6 +155,20 @@ class VLMModel:
             trust_remote_code=True,
         )
         self._vllm_loop = asyncio.new_event_loop()
+        # The evaluator submits one image at a time. Capture the actual public
+        # prompt/vision-token ranges so both the ViT and multimodal prefill can
+        # replay CUDA graphs. Larger private-set inputs safely fall back to eager.
+        compilation_config = {
+            "cudagraph_capture_sizes": [
+                1, 2, 4, 8, 16, 24, 32,
+                128, 192, 256, 320, 384, 448, 512, 576,
+            ],
+            "cudagraph_mm_encoder": True,
+            "encoder_cudagraph_token_budgets": [
+                256, 384, 512, 640, 768, 896, 1024,
+            ],
+            "encoder_cudagraph_max_vision_items_per_batch": 1,
+        }
         engine_args = AsyncEngineArgs(
             model=self.model_path,
             tokenizer=self.model_path,
@@ -167,6 +181,7 @@ class VLMModel:
             ),
             enable_prefix_caching=False,
             enforce_eager=os.environ.get("ZSX_PPU_EAGER") == "1",
+            compilation_config=compilation_config,
             skip_mm_profiling=True,
             limit_mm_per_prompt={"image": 1},
         )
