@@ -109,6 +109,64 @@ conv1d ─→ fused_post_conv_prep
 *fused 前的profiling*
 ![alt text](png/image-2.png)
 *fused 后的profiling*
+
+#### 优化目标与范围
+单 token decode 中 MLP 先算 gate/up 投影再执行 SiLU×up（SwiGLU），两段直接数据依赖，可由一个 kernel 完成，避免中间结果写回显存再读回。本融合指 **gate_up 投影 + SwiGLU 融合**（vLLM 原版已把 gate/up 两套权重合并为一次投影）。适用条件：BF16、TP=1、无量化/LoRA/bias、输入与权重连续且 16 字节对齐。原生融合形状：`x[1,2048]`、`weight[12288,2048]` → `h[1,6144]`；M=1 指算子实际输入只有一行（Graph padding 后 M>1 不命中）。不包含 `down_proj`、GDN、attention、LM head、视觉编码；其他形状由上层回退，直接调用原生算子会报错。
+
+#### 计算内容与接入
+令 D=6144，合并权重前 D 行为 gate、后 D 行为 up：`gate = x@W_gate.T`、`up = x@W_up.T`、`h = SiLU(gate)*up`、`y = h@W_down.T`（down_proj 保留在融合外）。
+
+```text
+Qwen3_5MLP.forward
+  ├─ eager 满足条件 → torch.ops._C.ppu_gate_silu
+  └─ 编译路径 → torch.ops.vllm.ppu_gate_silu
+                   ├─ 满足 M=1 等条件 → torch.ops._C.ppu_gate_silu
+                   └─ 不满足 → Linear + 激活回退
+      原生融合入口 → C++ ppu_gate_silu → vllm_ppu_gate_silu_launch
+                    → gate_silu_fused_pair_w4_kernel
+  → 原 vLLM down_proj
+```
+
+C++ 桥接检查设备/BF16/形状/连续性与对齐、分配输出、取当前 stream 传给 HGGC launcher；异步提交、检查启动错误，不做设备全局同步。
+
+#### M=1 局限与 prefill 路由（避免 TTFT 回退）
+当前实现只支持严格 M=1，主要覆盖首 token 之后的 decode；prefill 通常 M>1 不命中。旧接入在 prefill 虽不启动融合 kernel，却进入 custom op 后 fallback，破坏 Inductor 对 SiLU×up 的原融合：24 层 MLP 净增 24 次 launch，稳态 TTFT 由 50.945ms 增至 55.669ms（**+9.27%**），language/prefill 由 24.535ms 增至 27.628ms（**+12.61%**）。必须采用路由：
+
+```text
+M = 1 decode  → Gate-Up 融合 kernel
+M > 1 prefill → custom op 外直接使用原 vLLM/Inductor 路径
+```
+
+该路由可避免 TTFT 回退，但现有 M=1 kernel 本身不能优化 TTFT；真正优化 TTFT 需重新实现支持多 token GEMM 的 prefill 融合 kernel。
+
+#### PPU kernel 并行设计
+`csrc/ppu/gate_silu_fused.hg`，设备函数 `gate_silu_fused_pair_w4_kernel`（SDK HGGC 编译模式 + CUDA 风格线程、向量加载、shuffle）：
+
+| 参数 | 当前实现 |
+| --- | --- |
+| 每 block 线程数 | 128（4 个 32-lane warp） |
+| 每 block 输出数 | 2，总 block 数 6144/2 = 3072 |
+| 每 lane 每轮读取 | 8 个 BF16（`uint4` 载体，16 字节） |
+| K 维循环 | 步长 32×8=256，K=2048 共 8 轮 |
+| 点积累加 | FP32；`__shfl_down_sync` 归约 → lane 0 写共享内存 |
+
+warp 配对（`output_index = blockIdx.x*2 + (warp&1)`，`row = output_index + (warp>=2 ? 6144 : 0)`）：warp 0/1 计算两个 gate 行，warp 2/3 计算对应 up 行；block 内一次同步后 warp 0/1 的 lane 0 将 gate 与对应 up 配对，执行 SiLU 激活、逐元素乘法并写出。本卡 L2 为 64 MiB 而单份目标权重仅 48 MiB，重复访问权重受缓存影响；历史 device 基准使用轮换真实层权重降低该偏差。
+
+#### 实测结果（compile + CUDA Graph）
+两版均为 Inductor mode=3、`FULL_DECODE_ONLY`、`capture_sizes=[1]`、`enforce_eager=False`；纯文本、并发 1、固定输出 64 tokens、关 prefix cache；独立引擎 A→B，各预热 5 次、测 30 次，无 profiler，排除加载/编译/捕获时间；每版正式 Graph 回放 1890 次。
+
+| 指标（请求中位数） | 原路径 | 融合路径 | 变化 |
+| --- | ---: | ---: | ---: |
+| 引擎 TTFT | 26.828 ms | 29.511 ms | 慢 10.00% |
+| 引擎 TPOT | 2.97224 ms/token | 2.88664 ms/token | 快 2.88% |
+| Decode 吞吐 | 336.446 token/s | 346.423 token/s | 提高 2.97% |
+| 完整请求主机耗时 | 214.132 ms | 211.780 ms | 降低 1.10% |
+
+TPOT = (末 token 时间 − 首 token 时间)/63，decode 吞吐为其倒数，不是多并发服务总吞吐。融合后 30 次输出稳定且与基线 token 一致。TTFT 变慢与其 M=1 定位一致：decode 融合不能优化 TTFT，收益集中在 TPOT/decode 吞吐。
+
+#### 使用与核验
+在创建引擎和 Graph 捕获之前设置 `export VLLM_PPU_FUSED_GATE_SILU=1`（默认关闭）。关闭时用 0 并重新创建引擎；已捕获的 Graph 不会因之后修改 Python 开关而自动换路径。确认 Python 实际加载的是编译了 `ppu_gate_silu` `_C` 扩展的 PPU 版 vLLM（仅下载源码不代表安装环境已更新）。当前验证仅覆盖 M=1/Graph 配置，不代表所有 batch、图模式或多卡均已验证。
+
 ### fused qk norm gate kernel
 ![alt text](png/image-1.png)
 *baseline eager 的 profiling 结果*
@@ -125,39 +183,6 @@ conv1d ─→ fused_post_conv_prep
 - 环境变量必须在 Engine 初始化和图捕获**之前**设置；图捕获完成后修改不改变已捕获 graph 内容。
 
 
-## 多模态 CUDA Graph 与 QK/MRoPE 融合性能验证（四格 A/B）
-20 正式样本 + 3 warmup，MMBench dev EN，`max_num_seqs=1`；关闭 speculative decoding、async scheduling 与 FlashInfer sampler，并关闭 Gate+SiLU、GDN prefill/decode 融合避免干扰归因。四组仅切换 `VLLM_ENFORCE_EAGER` 与 `VLLM_PPU_FUSED_QK_NORM_GATE`。
-
-| 配置 | 平均 TTFT ms | P50 | P95 | 平均 tok/s | P50 | P95 | 冷启动 wall s | 正确率 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| eager，无融合 | 62.666 | 61.726 | 86.521 | 44.271 | 44.442 | 44.739 | 77.751 | 16/20 |
-| eager，QK/MRoPE 融合 | 58.974 | 61.539 | 65.531 | 47.385 | 47.793 | 48.957 | 77.482 | 16/20 |
-| CUDA Graph，无融合 | 47.810 | 32.027 | 52.041 | 223.836 | 231.714 | 234.733 | 258.283 | 16/20 |
-| CUDA Graph + QK/MRoPE 融合 | 46.574 | 31.964 | 55.282 | 233.338 | 235.776 | 237.126 | 243.086 | 16/20 |
-
-| 对比 | 平均 TTFT | P95 TTFT | 平均吞吐 | 冷启动 wall |
-|---|---:|---:|---:|---:|
-| 仅 CUDA Graph | -23.71% | -39.85% | +405.60% | +232.19% |
-| eager 下仅融合 | -5.89% | -24.26% | +7.03% | -0.35% |
-| Graph 下再开融合 | -2.59% | +6.23% | +4.25% | -5.88% |
-| Graph + 融合相对全关 | -25.68% | -36.11% | +427.07% | +212.65% |
-
-- **语义等价**：四组相对 `eager_no_fusion` 的 `response_text` / `parsed_answer` / `correct` / `token_count` 逐样本差异数全部为 0，正确率同为 16/20。
-- **冷启动说明**：CUDA Graph 两组为独立进程冷启动，首次 `torch.compile` 与图捕获计入 wall s 但不计入请求级 TTFT/吞吐（单个 compile range 约 25s）；生产应按常驻服务稳态评估。20 样本下 `graph_no_fusion → graph_qk_fusion` P95 TTFT +6.23%，小样本尾延迟仍有波动，不能只报告平均值。
-- **历史 500 样本辅助**（仅辅助，不作严格语义 A/B）：公共基线 67.870ms TTFT / 412.541 tok/s / 413/500；CUDA Graph tuned 48.526ms / 406.016 tok/s / 414/500（TTFT -28.50%、吞吐 -1.58%、wall +1.85%）；同图配置 fusion on 相对 off：吞吐 +1.75%、wall -4.41%，但 TTFT +0.19% 且正确数相差 1，不作为严格等价 A/B。
-
-### Profiler 证据（eager 模式观察 fused kernel，避免 `cudaGraphLaunch` 掩盖节点）
-Request 3，Torch profiler：
-
-| 指标 | fusion off | fusion on | 变化 |
-|---|---:|---:|---:|
-| Self CUDA time total | 184.682 ms | 170.403 ms | **-7.73%** |
-| 5 样本平均 TTFT | 78.845 ms | 73.895 ms | **-6.28%** |
-| 5 样本平均 tok/s | 37.791 | 39.553 | **+4.66%** |
-
-`_fused_qk_rmsnorm_rope_gate_kernel`：204 次调用、合计 618.323us（3.031us/次）；未融合链中单独 `_triton_mrope_forward`：350.719us。两者不可直接比较——前者含 RMSNorm+MRoPE+gate copy 整条链，后者仅是链中 MRoPE 单项；融合收益以 Self CUDA time 与端到端 TTFT/吞吐为准。
-
-**最终判断**：多模态算子融合在 `text_only=False`、`mrope=(11,11,10)` 的真实多模态请求中启用，profiler 出现 204 次 fused kernel 调用；严格 A/B 同时显示 Self CUDA time、TTFT 与吞吐改善且输出逐项一致，判定有效。CUDA Graph 与融合可叠加，报告应分别给出冷启动 wall、请求级稳态指标、尾延迟与语义等价性，不摘取单一最有利数字。
 
 ## 评测结果
 | setup | sample | en TTFT(ms) | en 吞吐(tps) | en Acc |
