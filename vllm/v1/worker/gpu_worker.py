@@ -231,6 +231,11 @@ class Worker(WorkerBase):
             yield
             return
 
+        # PPU does not support the temporary allocator setting used here.
+        if current_platform.get_device_name().startswith("PPU-"):
+            yield
+            return
+
         conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
         match = re.search(r"max_split_size_mb:(\d+)", conf)
         original_value = match.group(1) if match else None

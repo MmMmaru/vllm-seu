@@ -5,27 +5,10 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
-
-
-_VERBOSE_EN_INSTRUCTION = (
-    "Solve this single-choice question. Your response must make one final choice "
-    "among A/B/C/D clearly. You may include one short reason."
-)
-_VERBOSE_CN_INSTRUCTION = (
-    "请完成这道单选题。请给出你认为正确的选项，并可附带一句简短理由。"
-    "答案必须明确，且只能对应 A/B/C/D 中的一个选项。"
-)
-_ANSWER_MAX_TOKENS = 6
-
-
-def _make_answer_only_prompt(prompt: str) -> str:
-    prompt = prompt.replace(_VERBOSE_EN_INSTRUCTION, "Answer only: Answer: X (A/B/C/D).")
-    return prompt.replace(_VERBOSE_CN_INSTRUCTION, "仅回答：答案：X（A/B/C/D）。")
 
 
 @dataclass
@@ -162,11 +145,8 @@ class VLMModel:
             dtype="float16",
             max_model_len=2048,
             max_num_seqs=16,
-            gpu_memory_utilization=float(
-                os.environ.get("ZSX_GPU_MEMORY_UTILIZATION", "0.82")
-            ),
+            gpu_memory_utilization=0.80,
             enable_prefix_caching=False,
-            enforce_eager=os.environ.get("ZSX_PPU_EAGER") == "1",
             skip_mm_profiling=True,
             limit_mm_per_prompt={"image": 1},
         )
@@ -291,7 +271,7 @@ class VLMModel:
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": _make_answer_only_prompt(prompt)},
+                    {"type": "text", "text": prompt},
                 ],
             }
         ]
@@ -303,7 +283,7 @@ class VLMModel:
         sampling_params = SamplingParams(
             temperature=generation_config.temperature,
             top_p=generation_config.top_p,
-            max_tokens=min(generation_config.max_new_tokens, _ANSWER_MAX_TOKENS),
+            max_tokens=generation_config.max_new_tokens,
             output_kind=RequestOutputKind.DELTA,
         )
         llm_input = {

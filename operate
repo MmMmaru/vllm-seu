@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SAMPLES="${SAMPLES:-500}"
+MODE="${1:-fusion-ab}"
+LOG_DIR="$ROOT/.bench/ppu_tuning/logs"
+mkdir -p "$LOG_DIR"
+
+ensure_engine_stopped() {
+  if pgrep -af '[V]LLM::EngineCore'; then
+    echo "EngineCore is still running; stop it before starting the next arm." >&2
+    exit 1
+  fi
+}
+
+run_candidate() {
+  local enabled="$1"
+  local label="$2"
+  ensure_engine_stopped
+  VLLM_FUSION_DEBUG=1 \
+  VLLM_USE_FUSED_QK_NORM_ROPE_GATE="$enabled" \
+    bash "$ROOT/.bench/ppu_tuning/run_candidate_cold.sh" \
+      "result_${label}_${SAMPLES}.json" "$SAMPLES" \
+      2>&1 | tee "$LOG_DIR/${label}_${SAMPLES}.log"
+}
+
+bash "$ROOT/.bench/ppu_tuning/prepare_runtime_overlay.sh"
+
+case "$MODE" in
+  fusion-ab)
+    run_candidate 0 no_fusion
+    run_candidate 1 fusion
+    "$ROOT/.venv/bin/python" \
+      "$ROOT/.bench/ppu_tuning/compare_public_results.py" \
+      "$ROOT/result_no_fusion_${SAMPLES}.json" \
+      "$ROOT/result_fusion_${SAMPLES}.json" \
+      | tee "$LOG_DIR/fusion_comparison_${SAMPLES}.json"
+    ;;
+  full-ab)
+    ensure_engine_stopped
+    bash "$ROOT/.bench/ppu_tuning/run_baseline_cold.sh" \
+      "result_baseline_${SAMPLES}.json" "$SAMPLES" \
+      2>&1 | tee "$LOG_DIR/baseline_${SAMPLES}.log"
+    run_candidate 1 optimized_fusion
+    "$ROOT/.venv/bin/python" \
+      "$ROOT/.bench/ppu_tuning/compare_public_results.py" \
+      "$ROOT/result_baseline_${SAMPLES}.json" \
+      "$ROOT/result_optimized_fusion_${SAMPLES}.json" \
+      | tee "$LOG_DIR/full_comparison_${SAMPLES}.json"
+    ;;
+  *)
+    echo "Usage: $0 [fusion-ab|full-ab]" >&2
+    exit 2
+    ;;
+esac
