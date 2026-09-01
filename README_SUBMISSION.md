@@ -26,6 +26,8 @@ python setup.py bdist_wheel
 
 # 3. Install vLLM
 pip install dist/vllm*.whl
+
+pip install -e .
 ```
 
 ## 导入方式
