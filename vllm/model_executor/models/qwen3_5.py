@@ -159,12 +159,8 @@ class Qwen3_5MLP(Qwen2MoeMLP):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self._can_use_ppu_fused_gate_silu(x):
-            out = torch.ops._C.ppu_gate_silu(x, self.gate_up_proj.weight)
-        else:
-            gate_up, _ = self.gate_up_proj(x)
-            out = self.act_fn(gate_up)
-
+        gate_up, _ = self.gate_up_proj(x)
+        out = self.act_fn(gate_up)
         out, _ = self.down_proj(out)
         return out
 
