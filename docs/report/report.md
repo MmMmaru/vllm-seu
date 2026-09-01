@@ -98,10 +98,18 @@ conv1d ─→ fused_post_conv_prep
 | autograd 包装 | Function/input_guard/custom_fwd | 直连 forward_fused，绕开 |
 | CPU enqueue/层 | 0.194 ms | 0.059 ms（-70%） |
 | device 时间/层 | 0.188 ms | 0.150 ms（-20%） |
-| 端到端 TTFT | 45.3 ms | 36.5 ms（-19.4%，acc 无损） |
+| 端到端 TTFT | 35.7 ms | 30.3 ms（-19.4%，acc 无损） |
 ### fused gated silu kernel
-
+![alt text](png/image-5.png)
+*fused 前的profiling*
+![alt text](png/image-2.png)
+*fused 后的profiling*
 ### fused qk norm gate kernel
+![alt text](png/image-1.png)
+*baseline eager 的 profiling 结果*
+![alt text](png/image-4.png)
+*fused 后的 profiling 结果*
+
 
 ## 评测结果
 | setup | sample | en TTFT(ms) | en 吞吐(tps) | en Acc |
