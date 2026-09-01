@@ -10,9 +10,6 @@ computed by the organizer with the private judge package.
 from __future__ import annotations
 
 import os
-import sys
-
-sys.path[0] = os.getcwd()
 
 import argparse
 import csv
@@ -29,7 +26,7 @@ import pybase64 as base64
 import regex as re
 from PIL import Image
 
-from eval.evaluation_wrapper import GenerationConfig, VLMModel
+from vllm.eval.evaluation_wrapper import GenerationConfig, VLMModel
 
 ANSWER_RE = re.compile(
     r"(?:answer|答案|正确答案)\s*(?:is|为|是)?\s*[:：]?\s*\**\s*([ABCD])"
@@ -60,9 +57,9 @@ def parse_args() -> argparse.Namespace:
         help="Path to a public MMBench TSV file",
     )
     parser.add_argument(
-        "--model-path", type=str, default="/home/maru/huggingface/Qwen3.5-2B-W8A16-noGDN"  # 
+        "--model-path", type=str, default="/home/maru/huggingface/Qwen3.5-2B"
     )
-    parser.add_argument("--output", type=str, default="eval/results/result_public_w8a16_cn.json")
+    parser.add_argument("--output", type=str, default="eval/results/result_public_cn.json")
     parser.add_argument("--num-samples", type=int, default=200)
     parser.add_argument("--seed", type=int, default=20260625)
     parser.add_argument(
