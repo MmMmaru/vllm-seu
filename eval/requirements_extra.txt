@@ -1,0 +1,41 @@
+# Extra dependencies required by this submission (vLLM for SAIL PPU fork,
+# upstream flytiger-eco/vllm-for-sail, branch ppu-0.23.0).
+# 内容与 requirements/build/ppu.txt、requirements/ppu.txt 保持一致。
+
+# ==== requirements/build/ppu.txt ====
+# Should be mirrored in pyproject.toml
+cmake>=3.26.1
+ninja
+packaging>=24.2
+setuptools>=77.0.3,<81.0.0
+setuptools-scm>=8
+setuptools-rust>=1.9.0
+torch
+wheel
+jinja2>=3.1.6
+regex
+build
+protobuf >= 5.29.6, !=6.30.*, !=6.31.*, !=6.32.*, !=6.33.0.*, !=6.33.1.*, !=6.33.2.*, !=6.33.3.*, !=6.33.4.*
+
+# ==== requirements/ppu.txt ====
+# Common dependencies
+# 注意: -r common.txt 为相对引用,需与 vllm 仓库 requirements/common.txt 配合
+# (安装时请以 vllm 仓库根为基准执行: pip install -r requirements/build/ppu.txt
+# 与 pip install -r requirements/ppu.txt)
+-r common.txt
+
+numba
+
+# Dependencies for PPU
+# torch
+# torchaudio
+# flashmla==2.0.0
+# These must be updated alongside torch
+# torchvision
+# FlashInfer should be updated together with the Dockerfile
+# flashinfer-python
+apache-tvm-ffi==0.1.9
+# tilelang
+
+# Required for faster safetensors model loading
+fastsafetensors >= 0.2.2

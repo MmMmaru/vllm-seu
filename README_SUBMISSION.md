@@ -2,48 +2,8 @@
 
 ## 依赖清单
 
-本提交依赖 vLLM for SAIL PPU 定制版(上游 `flytiger-eco/vllm-for-sail`,分支 `ppu-0.23.0`)及其 PPU 依赖。安装入口与依赖内容如下,与 `requirements/build/ppu.txt`、`requirements/ppu.txt` 保持一致。
+本提交依赖 vLLM for SAIL PPU 定制版(上游 `flytiger-eco/vllm-for-sail`,分支 `ppu-0.23.0`)及其 PPU 依赖。完整依赖清单已写入随提交附带的 `eval/requirements_extra.txt`,与 vllm 仓库的 `requirements/build/ppu.txt`、`requirements/ppu.txt` 保持一致
 
-### 构建期依赖(requirements/build/ppu.txt)
-
-```text
-# Should be mirrored in pyproject.toml
-cmake>=3.26.1
-ninja
-packaging>=24.2
-setuptools>=77.0.3,<81.0.0
-setuptools-scm>=8
-setuptools-rust>=1.9.0
-torch
-wheel
-jinja2>=3.1.6
-regex
-build
-protobuf >= 5.29.6, !=6.30.*, !=6.31.*, !=6.32.*, !=6.33.0.*, !=6.33.1.*, !=6.33.2.*, !=6.33.3.*, !=6.33.4.*
-```
-
-### 运行期依赖(requirements/ppu.txt)
-
-```text
-# Common dependencies
--r common.txt
-
-numba
-
-# Dependencies for PPU
-# torch
-# torchaudio
-# flashmla==2.0.0
-# These must be updated alongside torch
-# torchvision
-# FlashInfer should be updated together with the Dockerfile
-# flashinfer-python
-apache-tvm-ffi==0.1.9
-# tilelang
-
-# Required for faster safetensors model loading
-fastsafetensors >= 0.2.2
-```
 
 ## 配置方法
 
@@ -80,4 +40,4 @@ from vllm.eval.evaluation_wrapper import VLMModel, GenerationConfig, GenerationR
 
 ## 技术细节
 
-详见 docs/report/report.pdf
+详见 docs/report/report.md
