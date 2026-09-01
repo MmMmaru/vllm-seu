@@ -35,8 +35,7 @@ pip install dist/vllm*.whl
 ```python
 from vllm.eval.evaluation_wrapper import VLMModel, GenerationConfig, GenerationResult
 ```
-
-本地自测入口:`benchmark_public.py --backend vllm --dataset-path <dev.tsv> --model-path <Qwen3.5-2B>`。
+backend选择vllm或者auto
 
 ## 技术细节
 
