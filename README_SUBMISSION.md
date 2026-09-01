@@ -31,7 +31,7 @@ pip install -e .
 ```
 
 ## 导入方式
-
+设置PYTHONPATH为vllm-seu根目录或使用 `pip install -e .` 安装后,即可在任意工作目录导入
 安装后,评测脚本(可位于任意工作目录)使用:
 
 ```python

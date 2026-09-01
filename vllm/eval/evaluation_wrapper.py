@@ -54,10 +54,10 @@ class VLMModel:
         self._tokenizer = None
         self._backend_name = "dummy"
 
-        if backend == "vllm":
+        if backend == "auto" or backend == "vllm":
             self._load_vllm_backend()
             self._backend_name = "vllm"
-        elif backend in {"auto", "transformers"}:
+        elif backend in {"transformers"}:
             try:
                 self._load_transformers_backend()
                 self._backend_name = "transformers"
